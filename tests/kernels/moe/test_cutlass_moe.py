@@ -23,16 +23,16 @@ from vllm.model_executor.layers.fused_moe.cutlass_moe import (
     run_cutlass_moe_fp8,
     run_cutlass_moe_w4a8_fp8,
 )
-from vllm.model_executor.layers.quantization.utils.quant_utils import (
-    pack_rows,
-    quantize_weights,
-)
-from vllm.scalar_type import scalar_types
 from vllm.model_executor.layers.fused_moe.prepare_finalize import (
     MoEPrepareAndFinalizeNoEP,
 )
 from vllm.model_executor.layers.fused_moe.utils import moe_kernel_quantize_input
+from vllm.model_executor.layers.quantization.utils.quant_utils import (
+    pack_rows,
+    quantize_weights,
+)
 from vllm.platforms import current_platform
+from vllm.scalar_type import scalar_types
 from vllm.utils.torch_utils import set_random_seed
 
 NUM_EXPERTS = [40, 64]
@@ -649,9 +649,7 @@ def make_w4a8_moe_tensors(
     _, a1q_scale = ops.scaled_fp8_quant(
         hidden_states, None, use_per_token_if_dynamic=True
     )
-    if a1q_scale.dim() == 0:
-        a1q_scale = a1q_scale.expand(M, 1)
-    elif a1q_scale.numel() != M and a1q_scale.numel() != M * 1:
+    if a1q_scale.dim() == 0 or (a1q_scale.numel() != M and a1q_scale.numel() != M * 1):
         a1q_scale = a1q_scale.expand(M, 1)
 
     # Router scores and top-k
@@ -665,9 +663,10 @@ def make_w4a8_moe_tensors(
         topk_ids[0, 1] = min(1, E - 1)
 
     wtype = scalar_types.int4
-    atype = torch.float8_e4m3fn
 
-    def quantize_and_pack_rows(w_float: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    def quantize_and_pack_rows(
+        w_float: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         """w_float (size_k, size_n). Returns w_q_packed (size_n//8, size_k), w_s."""
         w_ref, w_q, w_s, _ = quantize_weights(
             w_float, wtype, group_size=GROUP_SIZE_W4A8, zero_points=False
@@ -689,19 +688,16 @@ def make_w4a8_moe_tensors(
     w1_stacked = torch.stack(w1_qs)
     w1_packed, b_strides1 = ops.cutlass_encode_and_reorder_int4b_grouped(w1_stacked)
 
-    # W1 scales: quantize_weights gives (2*N/128, K) per expert; kernel wants (E, 2*N, K//128)
+    # W1 scales: quantize_weights gives (2*N/128, K) per expert;
+    # kernel wants (E, 2*N, K//128)
     n_groups_k = K // GROUP_SIZE_W4A8
-    w1_s_list = [
-        s.reshape(2 * N, n_groups_k) for s in w1_ss
-    ]
+    w1_s_list = [s.reshape(2 * N, n_groups_k) for s in w1_ss]
     w1_s_stack = torch.stack(w1_s_list)
     w1_scale_fp8 = _to_fp8(w1_s_stack)
     w1_scale_packed = ops.cutlass_pack_scale_fp8(
         w1_scale_fp8.permute(0, 2, 1).contiguous()
     )
-    w1_chan_scale = torch.ones(
-        (E, 2 * N), device=device, dtype=torch.float32
-    )
+    w1_chan_scale = torch.ones((E, 2 * N), device=device, dtype=torch.float32)
 
     # W2: logical (E, K, N) -> per expert (K, N) -> packed (N//8, K) for encode
     w2_qs = []
@@ -715,7 +711,8 @@ def make_w4a8_moe_tensors(
     w2_stacked = torch.stack(w2_qs)
     w2_packed, b_strides2 = ops.cutlass_encode_and_reorder_int4b_grouped(w2_stacked)
 
-    # W2 scales: quantize_weights gives (K/128, N) per expert; kernel wants (E, N, K//128)
+    # W2 scales: quantize_weights gives (K/128, N) per expert;
+    # kernel wants (E, N, K//128)
     w2_s_list = [s.reshape(N, n_groups_k) for s in w2_ss]
     w2_s_stack = torch.stack(w2_s_list)
     w2_scale_fp8 = _to_fp8(w2_s_stack)
@@ -772,7 +769,6 @@ def make_w4a8_moe_tensors(
         (128, 512, 512, 8, 2),
     ],
 )
-@pytest.mark.skip(reason="cutlass_encode_and_reorder_int4b_grouped is failed")
 def test_run_cutlass_moe_w4a8_fp8_no_graph(m, k, n, e, topk):
     """Test run_cutlass_moe_w4a8_fp8: output shape and workspace-independent result."""
     set_random_seed(7)
@@ -871,15 +867,12 @@ def test_run_cutlass_moe_w4a8_fp8_no_graph(m, k, n, e, topk):
     not IS_W4A8_SUPPORTED,
     reason="W4A8 CUTLASS MoE is not supported on this GPU.",
 )
-@pytest.mark.skip(reason="cutlass_encode_and_reorder_int4b_grouped is failed")
 def test_run_cutlass_moe_w4a8_fp8_with_expert_map():
     """Test run_cutlass_moe_w4a8_fp8 with expert_map (e.g. expert parallelism)."""
     set_random_seed(11)
     E_global = 8
     num_local = 4
-    tensors = make_w4a8_moe_tensors(
-        M=64, K=256, N=256, E=num_local, topk=2, seed=11
-    )
+    tensors = make_w4a8_moe_tensors(M=64, K=256, N=256, E=num_local, topk=2, seed=11)
     # This rank holds global experts 4..7 as local 0..3
     expert_map = torch.tensor(
         [-1, -1, -1, -1, 0, 1, 2, 3],

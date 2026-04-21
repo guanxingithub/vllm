@@ -1597,8 +1597,18 @@ def cutlass_encode_and_reorder_int4b_grouped(
 if hasattr(torch.ops._C, "cutlass_encode_and_reorder_int4b_grouped"):
 
     @register_fake("_C::cutlass_encode_and_reorder_int4b_grouped")
-    def cutlass_encode_and_reorder_int4b_grouped_fake(b: torch.Tensor) -> torch.Tensor:
-        return torch.empty_like(b, memory_format=torch.contiguous_format)
+    def cutlass_encode_and_reorder_int4b_grouped_fake(
+        b: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        num_experts = b.shape[0]
+        return (
+            torch.empty_like(b, memory_format=torch.contiguous_format),
+            torch.empty(
+                (num_experts, 3),
+                dtype=torch.int32,
+                device="cpu",
+            ),
+        )
 
 
 def permute_cols(a: torch.Tensor, perm: torch.Tensor) -> torch.Tensor:
