@@ -9,6 +9,7 @@ import torch
 
 import vllm.model_executor.layers.fused_moe.modular_kernel as mk
 from tests.kernels.moe.utils import make_dummy_moe_config
+from tests.kernels.utils import torch_experts
 from vllm import _custom_ops as ops
 from vllm.config import ParallelConfig, VllmConfig, set_current_vllm_config
 from vllm.model_executor.layers.fused_moe import fused_experts, fused_topk
@@ -17,14 +18,16 @@ from vllm.model_executor.layers.fused_moe.config import (
     FUSED_MOE_UNQUANTIZED_CONFIG,
     FusedMoEQuantConfig,
     fp8_w8a8_moe_quant_config,
+    int4_w4afp8_moe_quant_config,
 )
 from vllm.model_executor.layers.fused_moe.cutlass_moe import (
     CutlassExpertsFp8,
+    CutlassExpertsW4A8Fp8,
     run_cutlass_moe_fp8,
     run_cutlass_moe_w4a8_fp8,
 )
 from vllm.model_executor.layers.fused_moe.prepare_finalize import (
-    MoEPrepareAndFinalizeNoEP,
+    make_moe_prepare_and_finalize_no_dp_ep,
 )
 from vllm.model_executor.layers.fused_moe.utils import moe_kernel_quantize_input
 from vllm.model_executor.layers.quantization.utils.quant_utils import (
@@ -203,8 +206,8 @@ def run_with_expert_maps(
     for kwargs, new_quant_config in slice_experts():
         w2 = kwargs["w2"]
         a = kwargs["hidden_states"]
-        kernel = mk.FusedMoEModularKernel(
-            MoEPrepareAndFinalizeNoEP(),
+        kernel = mk.FusedMoEKernel(
+            make_moe_prepare_and_finalize_no_dp_ep(use_monolithic=False),
             CutlassExpertsFp8(
                 moe_config=make_dummy_moe_config(
                     num_experts=w2.shape[0],
@@ -216,7 +219,7 @@ def run_with_expert_maps(
             ),
             inplace=False,
         )
-        out_tensor = out_tensor + kernel(**kwargs)
+        out_tensor = out_tensor + kernel.apply(**kwargs)
 
     return out_tensor
 
@@ -263,8 +266,8 @@ def run_8_bit(
     num_experts = moe_tensors.w1.size(0)  # type: ignore[attr-defined]
     with_ep = num_local_experts is not None or num_local_experts == num_experts
     if not with_ep:
-        kernel = mk.FusedMoEModularKernel(
-            MoEPrepareAndFinalizeNoEP(),
+        kernel = mk.FusedMoEKernel(
+            make_moe_prepare_and_finalize_no_dp_ep(use_monolithic=False),
             CutlassExpertsFp8(
                 moe_config=make_dummy_moe_config(
                     num_experts=moe_tensors.w2_q.shape[0],  # type: ignore[union-attr]
@@ -276,7 +279,7 @@ def run_8_bit(
             ),
             inplace=False,
         )
-        return kernel(**kwargs)
+        return kernel.apply(**kwargs)
 
     assert num_local_experts is not None
     return run_with_expert_maps(
@@ -606,10 +609,16 @@ def _to_fp8(tensor: torch.Tensor) -> torch.Tensor:
 class W4A8MoETensors:
     """Tensors for testing run_cutlass_moe_w4a8_fp8."""
 
-    hidden_states: torch.Tensor
+    hidden_states: torch.Tensor  # bf16, shape (M, K) — reference activations
+    a1q: torch.Tensor  # fp8, shape (M, K) — quantized activations fed to the kernel
     a1q_scale: torch.Tensor
     w1: torch.Tensor
     w2: torch.Tensor
+    # Dequantized reference weights (bf16) used to build a numerical reference
+    # via torch_experts. These carry the same int4-group quantization error as
+    # the packed kernel inputs, so tolerance can stay tight on weights.
+    w1_ref: torch.Tensor  # shape (E, 2*N, K)
+    w2_ref: torch.Tensor  # shape (E, K, N)
     w1_scale: torch.Tensor
     w2_scale: torch.Tensor
     w1_chan_scale: torch.Tensor
@@ -644,9 +653,11 @@ def make_w4a8_moe_tensors(
     set_random_seed(seed)
     assert K % GROUP_SIZE_W4A8 == 0 and N % GROUP_SIZE_W4A8 == 0
 
-    # Hidden states (bf16) and per-token scale for dynamic quant
+    # Hidden states (bf16) plus fp8-quantized copy + per-token scale for the
+    # kernel. The kernel consumes already-quantized activations; the bf16 copy
+    # is retained so tests can build a float reference via torch_experts.
     hidden_states = torch.randn((M, K), device=device, dtype=torch.bfloat16) / 8
-    _, a1q_scale = ops.scaled_fp8_quant(
+    a1q, a1q_scale = ops.scaled_fp8_quant(
         hidden_states, None, use_per_token_if_dynamic=True
     )
     if a1q_scale.dim() == 0 or (a1q_scale.numel() != M and a1q_scale.numel() != M * 1):
@@ -666,24 +677,32 @@ def make_w4a8_moe_tensors(
 
     def quantize_and_pack_rows(
         w_float: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """w_float (size_k, size_n). Returns w_q_packed (size_n//8, size_k), w_s."""
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """w_float (size_k, size_n).
+
+        Returns (w_q_packed, w_s, w_ref):
+          w_q_packed: (size_n, size_k//8) int32, packed for cutlass encode.
+          w_s:        group-wise scale from quantize_weights.
+          w_ref:      (size_k, size_n) dequantized float — same quantization
+                      error as w_q_packed; used to build a numerical reference.
+        """
         w_ref, w_q, w_s, _ = quantize_weights(
             w_float, wtype, group_size=GROUP_SIZE_W4A8, zero_points=False
         )
-        del w_ref
         w_q = pack_rows(w_q & 0x0F, 4, w_q.size(0), w_q.size(1))
         w_q = w_q.t().contiguous()
-        return w_q, w_s
+        return w_q, w_s, w_ref
 
     # W1: logical (E, 2*N, K) -> per expert (2*N, K) -> packed (2*N//8, K)
     w1_qs: list[torch.Tensor] = []
     w1_ss: list[torch.Tensor] = []
+    w1_refs: list[torch.Tensor] = []
     for _ in range(E):
         w1_float = torch.randn((2 * N, K), device=device, dtype=torch.float16) / 8
-        w1_q, w1_s = quantize_and_pack_rows(w1_float)
+        w1_q, w1_s, w1_ref = quantize_and_pack_rows(w1_float)
         w1_qs.append(w1_q)
         w1_ss.append(w1_s)
+        w1_refs.append(w1_ref)
 
     w1_stacked = torch.stack(w1_qs)
     w1_packed, b_strides1 = ops.cutlass_encode_and_reorder_int4b_grouped(w1_stacked)
@@ -702,11 +721,13 @@ def make_w4a8_moe_tensors(
     # W2: logical (E, K, N) -> per expert (K, N) -> packed (N//8, K) for encode
     w2_qs = []
     w2_ss = []
+    w2_refs: list[torch.Tensor] = []
     for _ in range(E):
         w2_float = torch.randn((K, N), device=device, dtype=torch.float16) / 8
-        w2_q, w2_s = quantize_and_pack_rows(w2_float)
+        w2_q, w2_s, w2_ref = quantize_and_pack_rows(w2_float)
         w2_qs.append(w2_q)
         w2_ss.append(w2_s)
+        w2_refs.append(w2_ref)
 
     w2_stacked = torch.stack(w2_qs)
     w2_packed, b_strides2 = ops.cutlass_encode_and_reorder_int4b_grouped(w2_stacked)
@@ -731,11 +752,17 @@ def make_w4a8_moe_tensors(
     s_strides2 = torch.zeros((E, 2), device=device, dtype=torch.int64)
     s_strides2[:, 0] = K
 
+    w1_ref_stack = torch.stack([w.to(torch.bfloat16) for w in w1_refs])
+    w2_ref_stack = torch.stack([w.to(torch.bfloat16) for w in w2_refs])
+
     return W4A8MoETensors(
         hidden_states=hidden_states,
+        a1q=a1q,
         a1q_scale=a1q_scale,
         w1=w1_packed,
         w2=w2_packed,
+        w1_ref=w1_ref_stack,
+        w2_ref=w2_ref_stack,
         w1_scale=w1_scale_packed,
         w2_scale=w2_scale_packed,
         w1_chan_scale=w1_chan_scale,
@@ -770,7 +797,8 @@ def make_w4a8_moe_tensors(
     ],
 )
 def test_run_cutlass_moe_w4a8_fp8_no_graph(m, k, n, e, topk):
-    """Test run_cutlass_moe_w4a8_fp8: output shape and workspace-independent result."""
+    """run_cutlass_moe_w4a8_fp8: output matches a torch_experts reference and
+    does not depend on workspace contents."""
     set_random_seed(7)
     tensors = make_w4a8_moe_tensors(M=m, K=k, N=n, E=e, topk=topk)
 
@@ -783,15 +811,13 @@ def test_run_cutlass_moe_w4a8_fp8_no_graph(m, k, n, e, topk):
         prod(workspace2_shape), device="cuda", dtype=torch.bfloat16
     )
     output_shape = (tensors.M, tensors.K)
-    output = torch.empty(output_shape, device="cuda", dtype=torch.bfloat16)
 
-    run_cutlass_moe_w4a8_fp8(
-        output,
-        tensors.hidden_states,
-        tensors.w1,
-        tensors.w2,
-        tensors.topk_ids,
-        MoEActivation.SILU,
+    kernel_kwargs = dict(
+        hidden_states=tensors.a1q,
+        w1=tensors.w1,
+        w2=tensors.w2,
+        topk_ids=tensors.topk_ids,
+        activation=MoEActivation.SILU,
         global_num_experts=tensors.E,
         expert_map=None,
         w1_scale=tensors.w1_scale,
@@ -808,8 +834,6 @@ def test_run_cutlass_moe_w4a8_fp8_no_graph(m, k, n, e, topk):
         c_strides2=tensors.c_strides2,
         s_strides1=tensors.s_strides1,
         s_strides2=tensors.s_strides2,
-        workspace13=workspace13,
-        workspace2=workspace2,
         expert_num_tokens=None,
         out_dtype=torch.bfloat16,
         per_act_token=True,
@@ -817,50 +841,41 @@ def test_run_cutlass_moe_w4a8_fp8_no_graph(m, k, n, e, topk):
         use_batched_format=False,
         topk_weights=tensors.topk_weights,
         group_size=GROUP_SIZE_W4A8,
+    )
+
+    workspace13.random_()
+    output = torch.empty(output_shape, device="cuda", dtype=torch.bfloat16)
+    run_cutlass_moe_w4a8_fp8(
+        output, workspace13=workspace13, workspace2=workspace2, **kernel_kwargs
     )
 
     assert output.shape == output_shape
     assert output.dtype == torch.bfloat16
 
-    # Workspace-independent: same result with zeroed workspace
+    # Workspace-independent: zeroed workspace yields the same result.
     workspace13.zero_()
     workspace2.zero_()
     output_zero = torch.zeros(output_shape, device="cuda", dtype=torch.bfloat16)
     run_cutlass_moe_w4a8_fp8(
-        output_zero,
-        tensors.hidden_states,
-        tensors.w1,
-        tensors.w2,
-        tensors.topk_ids,
-        MoEActivation.SILU,
-        global_num_experts=tensors.E,
-        expert_map=None,
-        w1_scale=tensors.w1_scale,
-        w2_scale=tensors.w2_scale,
-        a1q_scale=tensors.a1q_scale,
-        a2_scale=None,
-        w1_chan_scale=tensors.w1_chan_scale,
-        w2_chan_scale=tensors.w2_chan_scale,
-        a_strides1=tensors.a_strides1,
-        a_strides2=tensors.a_strides2,
-        b_strides1=tensors.b_strides1,
-        b_strides2=tensors.b_strides2,
-        c_strides1=tensors.c_strides1,
-        c_strides2=tensors.c_strides2,
-        s_strides1=tensors.s_strides1,
-        s_strides2=tensors.s_strides2,
-        workspace13=workspace13,
-        workspace2=workspace2,
-        expert_num_tokens=None,
-        out_dtype=torch.bfloat16,
-        per_act_token=True,
-        per_out_ch=True,
-        use_batched_format=False,
-        topk_weights=tensors.topk_weights,
-        group_size=GROUP_SIZE_W4A8,
+        output_zero, workspace13=workspace13, workspace2=workspace2, **kernel_kwargs
     )
-
     torch.testing.assert_close(output, output_zero, atol=5e-3, rtol=1e-2)
+
+    # Numerical reference: run torch_experts on dequantized (bf16) weights.
+    # w_ref carries the same int4-group quantization error as the kernel's
+    # packed weights, so weight error is captured. The remaining discrepancy
+    # is dominated by fp8 activation quantization, hence the 1e-1 tolerance
+    # (matches the nvfp4 moe test pattern).
+    reference = torch_experts(
+        tensors.hidden_states,
+        tensors.w1_ref,
+        tensors.w2_ref,
+        tensors.topk_weights,
+        tensors.topk_ids,
+        global_num_experts=tensors.E,
+        activation=MoEActivation.SILU,
+    )
+    torch.testing.assert_close(output, reference, atol=1e-1, rtol=1e-1)
 
 
 @pytest.mark.skipif(
@@ -896,7 +911,7 @@ def test_run_cutlass_moe_w4a8_fp8_with_expert_map():
 
     run_cutlass_moe_w4a8_fp8(
         output,
-        tensors.hidden_states,
+        tensors.a1q,
         tensors.w1,
         tensors.w2,
         tensors.topk_ids,
@@ -929,3 +944,92 @@ def test_run_cutlass_moe_w4a8_fp8_with_expert_map():
     )
 
     assert output.shape == (tensors.M, tensors.K)
+
+
+@pytest.mark.skipif(
+    not IS_W4A8_SUPPORTED,
+    reason="W4A8 CUTLASS MoE is not supported on this GPU.",
+)
+@pytest.mark.parametrize(
+    "m,k,n,e,topk",
+    [
+        (64, 256, 256, 4, 2),
+        (128, 512, 512, 8, 2),
+    ],
+)
+def test_cutlass_moe_w4a8_fp8_modular(m, k, n, e, topk):
+    """Drive CutlassExpertsW4A8Fp8 through FusedMoEKernel — the production
+    wiring path — and check the output matches a torch_experts reference.
+
+    The direct-kernel tests above call run_cutlass_moe_w4a8_fp8 with hand-built
+    strides and pre-quantized activations. Real callers go through the modular
+    kernel, which does the fp8 activation quantization in prepare_finalize and
+    wires up the expert class; this test exercises that wiring.
+    """
+    set_random_seed(9)
+    tensors = make_w4a8_moe_tensors(M=m, K=k, N=n, E=e, topk=topk)
+
+    quant_config = int4_w4afp8_moe_quant_config(
+        w1_scale=tensors.w1_scale,
+        w2_scale=tensors.w2_scale,
+        g1_alphas=tensors.w1_chan_scale,
+        g2_alphas=tensors.w2_chan_scale,
+        per_act_token_quant=True,
+        per_out_ch_quant=True,
+    )
+
+    moe_config = make_dummy_moe_config(
+        num_experts=tensors.E,
+        experts_per_token=tensors.topk,
+        hidden_dim=tensors.K,
+        intermediate_size_per_partition=tensors.N,
+        in_dtype=torch.bfloat16,
+    )
+
+    experts = CutlassExpertsW4A8Fp8(
+        out_dtype=torch.bfloat16,
+        a_strides1=tensors.a_strides1,
+        a_strides2=tensors.a_strides2,
+        b_strides1=tensors.b_strides1,
+        b_strides2=tensors.b_strides2,
+        c_strides1=tensors.c_strides1,
+        c_strides2=tensors.c_strides2,
+        s_strides1=tensors.s_strides1,
+        s_strides2=tensors.s_strides2,
+        moe_config=moe_config,
+        quant_config=quant_config,
+        group_size=GROUP_SIZE_W4A8,
+    )
+
+    kernel = mk.FusedMoEKernel(
+        make_moe_prepare_and_finalize_no_dp_ep(use_monolithic=False),
+        experts,
+        inplace=False,
+    )
+
+    with set_current_vllm_config(vllm_config):
+        output = kernel.apply(
+            hidden_states=tensors.hidden_states,
+            w1=tensors.w1,
+            w2=tensors.w2,
+            topk_weights=tensors.topk_weights,
+            topk_ids=tensors.topk_ids,
+            activation=MoEActivation.SILU,
+            global_num_experts=tensors.E,
+            expert_map=None,
+            apply_router_weight_on_input=False,
+        )
+
+    assert output.shape == (tensors.M, tensors.K)
+    assert output.dtype == torch.bfloat16
+
+    reference = torch_experts(
+        tensors.hidden_states,
+        tensors.w1_ref,
+        tensors.w2_ref,
+        tensors.topk_weights,
+        tensors.topk_ids,
+        global_num_experts=tensors.E,
+        activation=MoEActivation.SILU,
+    )
+    torch.testing.assert_close(output, reference, atol=1e-1, rtol=1e-1)
