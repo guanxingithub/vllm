@@ -943,6 +943,22 @@ def test_run_cutlass_moe_w4a8_fp8_with_expert_map():
 
     assert output.shape == (tensors.M, tensors.K)
 
+    # Numerical reference: every token lands on a local expert (topk_ids was
+    # clamped into 4..7 and expert_map sends 4..7 -> local 0..3), so the EP
+    # output must equal torch_experts over the local weights with topk_ids
+    # shifted back into the local index space.
+    local_topk_ids = tensors.topk_ids - 4
+    reference = torch_experts(
+        tensors.hidden_states,
+        tensors.w1_ref,
+        tensors.w2_ref,
+        tensors.topk_weights,
+        local_topk_ids,
+        global_num_experts=num_local,
+        activation=MoEActivation.SILU,
+    )
+    torch.testing.assert_close(output, reference, atol=1e-1, rtol=1e-1)
+
 
 @pytest.mark.skipif(
     not IS_W4A8_SUPPORTED,
