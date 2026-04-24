@@ -1682,12 +1682,17 @@ if hasattr(torch.ops._C, "cutlass_encode_and_reorder_int4b_grouped"):
         b: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         num_experts = b.shape[0]
+        # Layout width mirrors sizeof(LayoutB_Reordered) / sizeof(int32_t) in
+        # csrc/libtorch_stable/quantization/cutlass_w4a8/w4a8_grouped_mm_entry.cu;
+        # a static_assert there pins it to 3 and will fail the build if the
+        # CUTLASS layout changes. Device must match the real op, which moves
+        # the layout tensor to b.device() before returning.
         return (
             torch.empty_like(b, memory_format=torch.contiguous_format),
             torch.empty(
                 (num_experts, 3),
                 dtype=torch.int32,
-                device="cpu",
+                device=b.device,
             ),
         )
 
