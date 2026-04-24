@@ -2,26 +2,15 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Pytest tests for trtllm_fp4_block_scale_moe in vllm.utils.flashinfer."""
 
+from unittest.mock import Mock
+
 import pytest
 import torch
-from unittest.mock import Mock
 
 import vllm.utils.flashinfer as flashinfer_mod
 from vllm.utils.flashinfer import trtllm_fp4_block_scale_moe
 
 BLOCK_SIZE = 16
-
-
-def _clear_wrapper_cache() -> None:
-    """Clear the lazy _get_impl cache so the next call re-resolves the backend."""
-    for cell in trtllm_fp4_block_scale_moe.__closure__ or ():
-        try:
-            fn = cell.cell_contents
-            if callable(fn) and hasattr(fn, "cache_clear"):
-                fn.cache_clear()
-                break
-        except (ValueError, AttributeError):
-            continue
 
 
 class TestTrtllmFp4BlockScaleMoeWrapper:
@@ -36,7 +25,7 @@ class TestTrtllmFp4BlockScaleMoeWrapper:
     ) -> None:
         """When FlashInfer is not available, the wrapper raises RuntimeError."""
         monkeypatch.setattr(flashinfer_mod, "has_flashinfer", lambda: False)
-        _clear_wrapper_cache()
+        trtllm_fp4_block_scale_moe.cache_clear()
 
         with pytest.raises(RuntimeError, match="FlashInfer backend is not available"):
             trtllm_fp4_block_scale_moe(
@@ -87,7 +76,7 @@ class TestTrtllmFp4BlockScaleMoeWrapper:
             if name == "flashinfer"
             else None,
         )
-        _clear_wrapper_cache()
+        trtllm_fp4_block_scale_moe.cache_clear()
 
         result = trtllm_fp4_block_scale_moe(
             routing_logits=torch.zeros(2, 4),
@@ -132,17 +121,15 @@ def _make_fp4_block_scale_moe_inputs(
     block_size: int = BLOCK_SIZE,
 ):
     """Create FP4 block-scale MoE inputs (uint8 fp4-packed, block_size=16)."""
-    routing_logits = torch.randn(
-        m, num_experts, device=device, dtype=torch.bfloat16
-    ) * 0.1
+    routing_logits = (
+        torch.randn(m, num_experts, device=device, dtype=torch.bfloat16) * 0.1
+    )
     hidden_states = torch.zeros(m, k, device=device, dtype=torch.uint8)
     hidden_states_scale = torch.ones(
         m, k // block_size, device=device, dtype=torch.float32
     )
     # gemm1: (E, 2*n, k), gemm2: (E, k, n)
-    gemm1_weights = torch.zeros(
-        num_experts, 2 * n, k, device=device, dtype=torch.uint8
-    )
+    gemm1_weights = torch.zeros(num_experts, 2 * n, k, device=device, dtype=torch.uint8)
     gemm1_weights_scale = torch.ones(
         num_experts,
         2 * n // block_size,
@@ -150,9 +137,7 @@ def _make_fp4_block_scale_moe_inputs(
         device=device,
         dtype=torch.float32,
     )
-    gemm2_weights = torch.zeros(
-        num_experts, k, n, device=device, dtype=torch.uint8
-    )
+    gemm2_weights = torch.zeros(num_experts, k, n, device=device, dtype=torch.uint8)
     gemm2_weights_scale = torch.ones(
         num_experts,
         k // block_size,
@@ -285,9 +270,7 @@ class TestTrtllmFp4BlockScaleMoeIntegration:
             gemm2_weights_scale,
         ) = _make_fp4_block_scale_moe_inputs(m, k, n, num_experts, top_k)
 
-        routing_bias = torch.ones(
-            num_experts, device="cuda", dtype=torch.bfloat16
-        )
+        routing_bias = torch.ones(num_experts, device="cuda", dtype=torch.bfloat16)
         with torch.inference_mode():
             out = _call_trtllm_fp4_block_scale_moe(
                 routing_logits=routing_logits,
@@ -300,6 +283,7 @@ class TestTrtllmFp4BlockScaleMoeIntegration:
                 num_experts=num_experts,
                 top_k=top_k,
                 n=n,
+                routing_bias=routing_bias,
             )
 
         assert out.dtype in (torch.bfloat16, torch.float32)
@@ -324,9 +308,7 @@ class TestTrtllmFp4BlockScaleMoeIntegration:
             gemm2_weights,
             gemm2_weights_scale,
         ) = _make_fp4_block_scale_moe_inputs(m, k, n, num_experts, top_k)
-        routing_bias = torch.zeros(
-            num_experts, device="cuda", dtype=torch.bfloat16
-        )
+        routing_bias = torch.zeros(num_experts, device="cuda", dtype=torch.bfloat16)
 
         with torch.inference_mode():
             out = _call_trtllm_fp4_block_scale_moe(

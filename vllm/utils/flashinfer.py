@@ -98,6 +98,9 @@ def _lazy_import_wrapper(
             return fallback_fn(*args, **kwargs)
         return impl(*args, **kwargs)
 
+    # Expose an explicit hook so tests can reset the cached backend
+    # resolution without introspecting the closure.
+    wrapper.cache_clear = _get_impl.cache_clear
     return wrapper
 
 

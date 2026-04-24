@@ -2,27 +2,16 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Pytest tests for flashinfer_trtllm_fp8_block_scale_moe in vllm.utils.flashinfer."""
 
+from unittest.mock import Mock
+
 import pytest
 import torch
-from unittest.mock import Mock
 
 import vllm.utils.flashinfer as flashinfer_mod
 from vllm.utils.flashinfer import flashinfer_trtllm_fp8_block_scale_moe
 
 # Block layout required by FlashInfer FP8 block-scale MoE
 BLOCK_M, BLOCK_N = 128, 128
-
-
-def _clear_wrapper_cache() -> None:
-    """Clear the lazy _get_impl cache so the next call re-resolves the backend."""
-    for cell in flashinfer_trtllm_fp8_block_scale_moe.__closure__ or ():
-        try:
-            fn = cell.cell_contents
-            if callable(fn) and hasattr(fn, "cache_clear"):
-                fn.cache_clear()
-                break
-        except (ValueError, AttributeError):
-            continue
 
 
 class TestFlashinferTrtllmFp8BlockScaleMoeWrapper:
@@ -37,7 +26,7 @@ class TestFlashinferTrtllmFp8BlockScaleMoeWrapper:
     ) -> None:
         """When FlashInfer is not available, the wrapper raises RuntimeError."""
         monkeypatch.setattr(flashinfer_mod, "has_flashinfer", lambda: False)
-        _clear_wrapper_cache()
+        flashinfer_trtllm_fp8_block_scale_moe.cache_clear()
 
         with pytest.raises(RuntimeError, match="FlashInfer backend is not available"):
             flashinfer_trtllm_fp8_block_scale_moe(
@@ -80,7 +69,7 @@ class TestFlashinferTrtllmFp8BlockScaleMoeWrapper:
             if name == "flashinfer.fused_moe"
             else None,
         )
-        _clear_wrapper_cache()
+        flashinfer_trtllm_fp8_block_scale_moe.cache_clear()
 
         result = flashinfer_trtllm_fp8_block_scale_moe(
             routing_logits=torch.zeros(2, 4),
@@ -118,9 +107,10 @@ def _make_fp8_block_scale_moe_inputs(
 ):
     """Create FP8 block-scale MoE inputs with correct scale shapes (128x128 blocks)."""
     g = torch.Generator(device=device).manual_seed(seed)
-    routing_logits = torch.randn(
-        m, num_experts, device=device, dtype=torch.bfloat16, generator=g
-    ) * 0.1
+    routing_logits = (
+        torch.randn(m, num_experts, device=device, dtype=torch.bfloat16, generator=g)
+        * 0.1
+    )
     hidden_states = (
         torch.randn(m, k, device=device, dtype=torch.float32, generator=g) * 0.1
     ).to(torch.float8_e4m3fn)
@@ -141,24 +131,26 @@ def _make_fp8_block_scale_moe_inputs(
         )
         * 0.1
     ).to(torch.float8_e4m3fn)
-    num_blocks_gemm1 = (
-        2 * intermediate_size * k + BLOCK_M * BLOCK_N - 1
-    ) // (BLOCK_M * BLOCK_N)
+    num_blocks_gemm1 = (2 * intermediate_size * k + BLOCK_M * BLOCK_N - 1) // (
+        BLOCK_M * BLOCK_N
+    )
     gemm1_weights_scale = torch.ones(
         num_experts, num_blocks_gemm1, device=device, dtype=torch.float32
     )
     gemm2_weights = (
         torch.randn(
-            num_experts, k, intermediate_size,
+            num_experts,
+            k,
+            intermediate_size,
             device=device,
             dtype=torch.float32,
             generator=g,
         )
         * 0.1
     ).to(torch.float8_e4m3fn)
-    num_blocks_gemm2 = (
-        k * intermediate_size + BLOCK_M * BLOCK_N - 1
-    ) // (BLOCK_M * BLOCK_N)
+    num_blocks_gemm2 = (k * intermediate_size + BLOCK_M * BLOCK_N - 1) // (
+        BLOCK_M * BLOCK_N
+    )
     gemm2_weights_scale = torch.ones(
         num_experts, num_blocks_gemm2, device=device, dtype=torch.float32
     )
@@ -248,13 +240,11 @@ class TestFlashinferTrtllmFp8BlockScaleMoeIntegration:
             gemm2_weights_scale,
         ) = _make_fp8_block_scale_moe_inputs(m, k, n, num_experts, top_k)
 
-        routing_bias = torch.ones(
-            num_experts, device="cuda", dtype=torch.bfloat16
-        )
+        routing_bias = torch.ones(num_experts, device="cuda", dtype=torch.bfloat16)
         with torch.inference_mode():
             out = flashinfer_trtllm_fp8_block_scale_moe(
                 routing_logits=routing_logits,
-                routing_bias=None,
+                routing_bias=routing_bias,
                 hidden_states=hidden_states,
                 hidden_states_scale=hidden_states_scale,
                 gemm1_weights=gemm1_weights,
@@ -295,9 +285,7 @@ class TestFlashinferTrtllmFp8BlockScaleMoeIntegration:
             gemm2_weights,
             gemm2_weights_scale,
         ) = _make_fp8_block_scale_moe_inputs(m, k, n, num_experts, top_k)
-        routing_bias = torch.zeros(
-            num_experts, device="cuda", dtype=torch.bfloat16
-        )
+        routing_bias = torch.zeros(num_experts, device="cuda", dtype=torch.bfloat16)
 
         with torch.inference_mode():
             out = flashinfer_trtllm_fp8_block_scale_moe(
@@ -342,9 +330,7 @@ class TestFlashinferTrtllmFp8BlockScaleMoeIntegration:
             gemm1_weights_scale,
             gemm2_weights,
             gemm2_weights_scale,
-        ) = _make_fp8_block_scale_moe_inputs(
-            m, k, n, num_experts, top_k, seed=123
-        )
+        ) = _make_fp8_block_scale_moe_inputs(m, k, n, num_experts, top_k, seed=123)
 
         with torch.inference_mode():
             out1 = flashinfer_trtllm_fp8_block_scale_moe(

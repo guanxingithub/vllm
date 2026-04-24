@@ -2,24 +2,13 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Pytest tests for flashinfer_trtllm_bf16_moe in vllm.utils.flashinfer."""
 
+from unittest.mock import Mock
+
 import pytest
 import torch
-from unittest.mock import Mock
 
 import vllm.utils.flashinfer as flashinfer_mod
 from vllm.utils.flashinfer import flashinfer_trtllm_bf16_moe
-
-
-def _clear_wrapper_cache() -> None:
-    """Clear the lazy _get_impl cache so the next call re-resolves the backend."""
-    for cell in flashinfer_trtllm_bf16_moe.__closure__ or ():
-        try:
-            fn = cell.cell_contents
-            if callable(fn) and hasattr(fn, "cache_clear"):
-                fn.cache_clear()
-                break
-        except (ValueError, AttributeError):
-            continue
 
 
 class TestFlashinferTrtllmBf16MoeWrapper:
@@ -34,7 +23,7 @@ class TestFlashinferTrtllmBf16MoeWrapper:
     ) -> None:
         """When FlashInfer is not available, the wrapper raises RuntimeError."""
         monkeypatch.setattr(flashinfer_mod, "has_flashinfer", lambda: False)
-        _clear_wrapper_cache()
+        flashinfer_trtllm_bf16_moe.cache_clear()
 
         with pytest.raises(RuntimeError, match="FlashInfer backend is not available"):
             flashinfer_trtllm_bf16_moe(
@@ -73,7 +62,7 @@ class TestFlashinferTrtllmBf16MoeWrapper:
             if name == "flashinfer.fused_moe"
             else None,
         )
-        _clear_wrapper_cache()
+        flashinfer_trtllm_bf16_moe.cache_clear()
 
         result = flashinfer_trtllm_bf16_moe(
             routing_logits=torch.zeros(2, 4, dtype=torch.bfloat16),
@@ -107,24 +96,29 @@ def _make_bf16_moe_inputs(
 ):
     """Create bf16 MoE inputs: routing_logits, hidden_states, gemm1/gemm2 weights."""
     g = torch.Generator(device=device).manual_seed(seed)
-    routing_logits = torch.randn(
-        m, num_experts, device=device, dtype=torch.bfloat16, generator=g
-    ) * 0.1
-    hidden_states = torch.randn(
-        m, k, device=device, dtype=torch.bfloat16, generator=g
-    ) * 0.1
+    routing_logits = (
+        torch.randn(m, num_experts, device=device, dtype=torch.bfloat16, generator=g)
+        * 0.1
+    )
+    hidden_states = (
+        torch.randn(m, k, device=device, dtype=torch.bfloat16, generator=g) * 0.1
+    )
     # gemm1: (E, 2*n, k), gemm2: (E, k, n)
-    gemm1_weights = torch.randn(
-        num_experts,
-        2 * n,
-        k,
-        device=device,
-        dtype=torch.bfloat16,
-        generator=g,
-    ) * 0.1
-    gemm2_weights = torch.randn(
-        num_experts, k, n, device=device, dtype=torch.bfloat16, generator=g
-    ) * 0.1
+    gemm1_weights = (
+        torch.randn(
+            num_experts,
+            2 * n,
+            k,
+            device=device,
+            dtype=torch.bfloat16,
+            generator=g,
+        )
+        * 0.1
+    )
+    gemm2_weights = (
+        torch.randn(num_experts, k, n, device=device, dtype=torch.bfloat16, generator=g)
+        * 0.1
+    )
     return routing_logits, hidden_states, gemm1_weights, gemm2_weights
 
 
