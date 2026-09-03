@@ -240,7 +240,13 @@ def kernel_warmup(worker: "Worker", *, process_local_only: bool = False):
         # Warmup with mixed batch containing both prefill and decode tokens
         # This is to warm up both prefill and decode attention kernels
         worker.model_runner._dummy_run(
-            num_tokens=16,
+            # Respect the token budget: a hardcoded 16 overruns input buffers sized
+            # by max_num_batched_tokens when the budget is smaller, and the resulting
+            # metadata/input size disagreement trips the FlashInfer prefill_query
+            # assert during warmup.
+            num_tokens=min(
+                16, worker.model_runner.scheduler_config.max_num_batched_tokens
+            ),
             skip_eplb=True,
             is_profile=True,
             force_attention=True,
